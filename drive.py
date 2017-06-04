@@ -11,62 +11,57 @@ import eventlet.wsgi
 from PIL import Image
 from flask import Flask
 from io import BytesIO
-
+import cv2
+import math
 from keras.models import load_model
-import h5py
-from keras import __version__ as keras_version
+import sys
+import os
+import tensorflow as tf
 
 sio = socketio.Server()
 app = Flask(__name__)
 model = None
 prev_image_array = None
 
+# image preprocessing, same as used while training
+def preprocessImage(image, new_size_col, new_size_row):
+    shape = image.shape
+    # note: numpy arrays are (row, col)!
+    image = image[math.floor(shape[0]/5):shape[0]-25, 0:shape[1]]
+    image = cv2.resize(image,(new_size_col, new_size_row), interpolation=cv2.INTER_AREA) 
+    return image
 
-class SimplePIController:
-    def __init__(self, Kp, Ki):
-        self.Kp = Kp
-        self.Ki = Ki
-        self.set_point = 0.
-        self.error = 0.
-        self.integral = 0.
+# Throttle adjustment
+def adjust_throttle_for_speed(speed, min_speed=10.0, max_speed=30.0, boost=10.0):
+    if speed < min_speed: return (min_speed+boost-speed)/max_speed
+    if speed > max_speed: return (max_speed-boost-speed)/max_speed
+    return 0.
 
-    def set_desired(self, desired):
-        self.set_point = desired
+def adjust_throttle_for_steering(steering, new_steering):
+    return -abs(steering/25.0-new_steering)/0.5
 
-    def update(self, measurement):
-        # proportional error
-        self.error = self.set_point - measurement
-
-        # integral error
-        self.integral += self.error
-
-        return self.Kp * self.error + self.Ki * self.integral
-
-
-controller = SimplePIController(0.1, 0.002)
-set_speed = 9
-controller.set_desired(set_speed)
-
-
+throt,mins,maxs,boost=.25,20,30,10
 @sio.on('telemetry')
 def telemetry(sid, data):
     if data:
-        # The current steering angle of the car
-        steering_angle = data["steering_angle"]
-        # The current throttle of the car
-        throttle = data["throttle"]
-        # The current speed of the car
-        speed = data["speed"]
-        # The current image from the center camera of the car
+        steering_angle = float(data["steering_angle"])
+        throttle = float(data["throttle"])
+        speed = float(data["speed"])
         imgString = data["image"]
         image = Image.open(BytesIO(base64.b64decode(imgString)))
         image_array = np.asarray(image)
-        steering_angle = float(model.predict(image_array[None, :, :, :], batch_size=1))
-
-        throttle = controller.update(float(speed))
-
-        print(steering_angle, throttle)
-        send_control(steering_angle, throttle)
+        image_array = np.asarray(image)[40:160,10:310,:]
+        image_array=cv2.resize(image_array, (size_x,size_y)) # None,fx=.5,fy=.5,interpolation=cv2.INTER_CUBIC)
+        transformed_image_array = image_array[None, :, :, :]
+        try:
+            out_steering_angle = float(model.predict(transformed_image_array, batch_size=1))
+            #throttle = 0.5 + adjust_throttle_for_speed(speed,0,10,15) #+ adjust_throttle_for_steering(steering_angle, out_steering_angle)
+            throttle = throt + adjust_throttle_for_speed(speed,mins,maxs,boost)
+        except:
+            print("Unexpected error:", sys.exc_info()[0])
+            out_steering_angle = 0
+        print(throttle, out_steering_angle)
+        send_control(out_steering_angle, throttle)
 
         # save frame
         if args.image_folder != '':
@@ -76,7 +71,6 @@ def telemetry(sid, data):
     else:
         # NOTE: DON'T EDIT THIS.
         sio.emit('manual', data={}, skip_sid=True)
-
 
 @sio.on('connect')
 def connect(sid, environ):
@@ -108,18 +102,32 @@ if __name__ == '__main__':
         default='',
         help='Path to image folder. This is where the images from the run will be saved.'
     )
+    parser.add_argument(
+        '--throttle', type=float, required=False, default=0.25,
+        help='Default throttle.'
+    )
+    parser.add_argument(
+        '--min', type=int, required=False, default=20,
+        help='Minimum speed to target.'
+    )
+    parser.add_argument(
+        '--max',  type=int, required=False, default=30,
+        help='Maximum speed to target.'
+    )
+    parser.add_argument(
+        '--boost', type=int, required=False, default=10,
+        help='Throttle boost (or slowdown) when speed in outside specified range.'
+    )
     args = parser.parse_args()
 
-    # check that model Keras version is same as local Keras version
-    f = h5py.File(args.model, mode='r')
-    model_version = f.attrs.get('keras_version')
-    keras_version = str(keras_version).encode('utf8')
-
-    if model_version != keras_version:
-        print('You are using Keras version ', keras_version,
-              ', but the model was built using ', model_version)
-
+    if (args.throttle): throt=args.throttle
+    if (args.min): mins=args.min
+    if (args.max): maxs=args.max
+    if (args.boost): boost=args.boost
+    print('throt,mins,maxs,boost=',throt,mins,maxs,boost)
     model = load_model(args.model)
+    _ign,size_y,size_x,_ignChannels = model.layers[0].input_shape
+    print('image_size=(',size_x,size_y,')')
 
     if args.image_folder != '':
         print("Creating image folder at {}".format(args.image_folder))
